@@ -181,7 +181,7 @@ async function warmSellerSession(
   sellerId: string
 ): Promise<WbCatalogResponse | null> {
   const sellerUrl = `https://www.wildberries.ru/seller/${sellerId}`;
-  let captured: WbCatalogResponse | null = null;
+  const state: { captured: WbCatalogResponse | null } = { captured: null };
 
   const onResponse = async (response: Response) => {
     const url = response.url();
@@ -190,7 +190,7 @@ async function warmSellerSession(
     try {
       const data = (await response.json()) as WbCatalogResponse;
       if (data.products?.length) {
-        captured = {
+        state.captured = {
           products: data.products,
           total: Math.max(data.total ?? 0, data.products.length),
         };
@@ -220,8 +220,8 @@ async function warmSellerSession(
     await page.mouse.wheel(0, 600);
     await page.waitForTimeout(2000);
 
-    if (captured?.products?.length) {
-      return captured;
+    if (state.captured?.products?.length) {
+      return state.captured;
     }
   } catch {
     // navigation errors are ok if data was captured
@@ -229,7 +229,7 @@ async function warmSellerSession(
     page.off("response", onResponse);
   }
 
-  return captured;
+  return state.captured;
 }
 
 async function loadFirstCatalogPage(
@@ -240,7 +240,7 @@ async function loadFirstCatalogPage(
   onStatus("Открываем страницу продавца...");
   const captured = await warmSellerSession(page, sellerId);
   if (captured?.products?.length || (captured?.total ?? 0) > 0) {
-    return captured;
+    return captured!;
   }
 
   onStatus("Загружаем каталог товаров...");
