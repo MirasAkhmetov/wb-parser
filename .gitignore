@@ -1,0 +1,11 @@
+/node_modules
+.playwright-browsers/
+.wb-profile/
+/.next/
+/out/
+/build
+.DS_Store
+*.pem
+npm-debug.log*
+.env*.local
+*.tsbuildinfo

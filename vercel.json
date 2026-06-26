@@ -1,0 +1,20 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "nextjs",
+  "buildCommand": "npm run build",
+  "installCommand": "npm install",
+  "functions": {
+    "app/api/wildberries/route.ts": {
+      "memory": 1024,
+      "maxDuration": 300
+    },
+    "app/api/wildberries/search/route.ts": {
+      "memory": 1024,
+      "maxDuration": 300
+    },
+    "app/api/wildberries/compare/route.ts": {
+      "memory": 1024,
+      "maxDuration": 300
+    }
+  }
+}
