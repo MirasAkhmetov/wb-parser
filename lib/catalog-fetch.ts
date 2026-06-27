@@ -4,7 +4,7 @@ const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36";
 
 const FETCH_TIMEOUT_MS = process.env.VERCEL ? 8000 : 12000;
-const PAGE_DELAY_MS = process.env.VERCEL ? 1200 : 500;
+const PAGE_DELAY_MS = process.env.VERCEL ? 2000 : 500;
 
 export interface WbApiProduct {
   id: number;
@@ -30,7 +30,11 @@ export interface WbCatalogResponse {
   total?: number;
 }
 
-export function buildCatalogUrls(sellerId: string, pageNum: number): string[] {
+export function buildCatalogUrls(
+  sellerId: string,
+  pageNum: number,
+  options: { withInternal?: boolean } = {}
+): string[] {
   const params = new URLSearchParams({
     ab_testing: "false",
     appType: "1",
@@ -49,7 +53,7 @@ export function buildCatalogUrls(sellerId: string, pageNum: number): string[] {
     `https://catalog.wb.ru/sellers/v4/catalog?${params}`,
   ];
 
-  if (!process.env.VERCEL) {
+  if (options.withInternal || !process.env.VERCEL) {
     urls.push(
       `https://www.wildberries.ru/__internal/u-catalog/sellers/v4/catalog?${params}`
     );

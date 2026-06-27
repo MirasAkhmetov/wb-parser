@@ -246,7 +246,8 @@ export function isBlockedPageContent(content: string): boolean {
 }
 
 export async function withWbPage<T>(
-  fn: (page: Page) => Promise<T>
+  fn: (page: Page) => Promise<T>,
+  options: { skipWarmup?: boolean } = {}
 ): Promise<T> {
   let lastError: unknown;
 
@@ -258,7 +259,9 @@ export async function withWbPage<T>(
       cleanup = session.cleanup;
       const { page } = session;
 
-      await warmUpWbSession(page);
+      if (!options.skipWarmup) {
+        await warmUpWbSession(page);
+      }
       return await fn(page);
     } catch (error) {
       lastError = error;
