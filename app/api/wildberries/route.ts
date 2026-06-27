@@ -5,7 +5,6 @@ import { getApiErrorPayload } from "@/lib/api-error";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
-export const preferredRegion = ["fra1", "cdg1", "arn1"];
 
 interface RequestBody {
   url: string;

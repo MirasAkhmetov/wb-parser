@@ -6,8 +6,7 @@
   "functions": {
     "app/api/wildberries/route.ts": {
       "memory": 1024,
-      "maxDuration": 300,
-      "regions": ["fra1", "cdg1", "arn1"]
+      "maxDuration": 300
     },
     "app/api/wildberries/search/route.ts": {
       "memory": 1024,
