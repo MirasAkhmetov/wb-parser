@@ -46,7 +46,7 @@ export function wrapBrowserError(error: unknown): never {
 async function launchOnVercel(): Promise<Browser> {
   if (!process.env.BROWSERLESS_TOKEN) {
     throw new ParseError(
-      "На Vercel не настроен BROWSERLESS_TOKEN. Парсинг через API должен работать без браузера.",
+      "Не настроен BROWSERLESS_TOKEN в переменных окружения Vercel.",
       "UNAVAILABLE"
     );
   }

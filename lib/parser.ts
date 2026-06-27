@@ -355,17 +355,21 @@ export async function parseWildberriesSeller(
       trademarkOptions
     );
   } catch (error) {
-    if (process.env.VERCEL) throw error;
-
     if (
       error instanceof ParseError &&
-      (error.code === "BLOCKED" ||
-        error.code === "NOT_FOUND" ||
-        error.code === "INVALID_URL")
+      (error.code === "NOT_FOUND" || error.code === "INVALID_URL")
     ) {
       throw error;
     }
-    // Локально — запасной вариант через браузер
+
+    onProgress?.({
+      currentPage: 0,
+      totalPages: null,
+      productsFound: 0,
+      status: process.env.VERCEL
+        ? "Подключаем браузер..."
+        : "Подключаемся к Wildberries...",
+    });
   }
 
   return withWbPage(async (page) => {
