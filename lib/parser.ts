@@ -14,6 +14,7 @@ import {
 import {
   buildCatalogUrls,
   fetchCatalogPageDirect,
+  PAGE_DELAY_MS,
   type WbApiProduct,
   type WbCatalogResponse,
 } from "./catalog-fetch";
@@ -220,8 +221,9 @@ async function parseSellerCatalog(
   sellerId: string,
   onProgress: ParseCallbacks["onProgress"],
   fetchPage: (pageNum: number) => Promise<WbCatalogResponse>
-): Promise<{ allProducts: WbProduct[]; totalPages: number }> {
+): Promise<{ allProducts: WbProduct[]; totalPages: number; partial: boolean; total: number }> {
   const allProducts: WbProduct[] = [];
+  let partial = false;
 
   const reportProgress = (
     currentPage: number,
@@ -254,51 +256,48 @@ async function parseSellerCatalog(
     `Найдено ${allProducts.length} из ${total} товаров...`
   );
 
-  if (totalPages > 1) {
-    const remainingPages = Array.from(
-      { length: totalPages - 1 },
-      (_, index) => index + 2
+  for (let pageNum = 2; pageNum <= totalPages; pageNum++) {
+    reportProgress(
+      pageNum,
+      totalPages,
+      `Страница ${pageNum} из ${totalPages} — загрузка...`
     );
-    const batchSize = process.env.VERCEL ? 4 : 2;
 
-    for (let index = 0; index < remainingPages.length; index += batchSize) {
-      const batch = remainingPages.slice(index, index + batchSize);
-      const lastPageInBatch = batch[batch.length - 1] ?? totalPages;
+    await new Promise((r) => setTimeout(r, PAGE_DELAY_MS));
 
+    try {
+      const catalogData = await fetchPage(pageNum);
+      if (!catalogData.products?.length) break;
+
+      allProducts.push(...catalogData.products.map(mapApiProduct));
       reportProgress(
-        lastPageInBatch,
-        totalPages,
-        `Страница ${lastPageInBatch} из ${totalPages} — загрузка...`
-      );
-
-      const batchResults = await Promise.all(batch.map((pageNum) => fetchPage(pageNum)));
-      let hasEmptyPage = false;
-
-      for (const catalogData of batchResults) {
-        allProducts.push(...(catalogData.products ?? []).map(mapApiProduct));
-        if (!catalogData.products?.length) {
-          hasEmptyPage = true;
-        }
-      }
-
-      reportProgress(
-        lastPageInBatch,
+        pageNum,
         totalPages,
         `Найдено ${allProducts.length} из ${total} товаров...`
       );
-
-      if (hasEmptyPage) break;
+    } catch (error) {
+      if (allProducts.length > 0) {
+        partial = true;
+        reportProgress(
+          pageNum,
+          totalPages,
+          `Загружено ${allProducts.length} из ${total} — Wildberries ограничил доступ к остальным страницам.`
+        );
+        break;
+      }
+      throw error;
     }
   }
 
-  return { allProducts, totalPages };
+  return { allProducts, totalPages, partial, total };
 }
 
 function finalizeParseResult(
   sellerId: string,
   allProducts: WbProduct[],
   totalPages: number,
-  trademarkOptions: TrademarkOptions
+  trademarkOptions: TrademarkOptions,
+  options: { partial?: boolean; total?: number } = {}
 ): ParseResult {
   const uniqueProducts = dedupeAndSort(allProducts);
   const { products, flaggedCount } = applyTrademarkFlags(
@@ -310,11 +309,18 @@ function finalizeParseResult(
     throw new ParseError("Товары не найдены.", "NOT_FOUND");
   }
 
+  const warning =
+    options.partial && options.total
+      ? `Загружено ${products.length} из ${options.total} товаров. Wildberries ограничил доступ — попробуйте позже для полного списка.`
+      : undefined;
+
   return {
     products,
     totalPages,
     sellerId,
     flaggedCount,
+    partial: options.partial,
+    warning,
   };
 }
 
@@ -323,20 +329,27 @@ async function parseWildberriesSellerViaApi(
   callbacks: ParseCallbacks,
   trademarkOptions: TrademarkOptions
 ): Promise<ParseResult> {
-  const { allProducts, totalPages } = await parseSellerCatalog(
+  const { allProducts, totalPages, partial, total } = await parseSellerCatalog(
     sellerId,
     callbacks.onProgress,
     (pageNum) => fetchCatalogPageDirect(sellerId, pageNum)
   );
 
+  const status = partial
+    ? `Частично: ${allProducts.length} из ${total} товаров.`
+    : `Готово! Найдено ${allProducts.length} товаров.`;
+
   callbacks.onProgress?.({
     currentPage: totalPages,
     totalPages,
     productsFound: allProducts.length,
-    status: `Готово! Найдено ${allProducts.length} товаров.`,
+    status,
   });
 
-  return finalizeParseResult(sellerId, allProducts, totalPages, trademarkOptions);
+  return finalizeParseResult(sellerId, allProducts, totalPages, trademarkOptions, {
+    partial,
+    total,
+  });
 }
 
 export async function parseWildberriesSeller(

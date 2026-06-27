@@ -30,6 +30,8 @@ export interface ParseResult {
   totalPages: number;
   sellerId: string;
   flaggedCount: number;
+  partial?: boolean;
+  warning?: string;
 }
 
 export interface ParseCallbacks {

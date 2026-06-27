@@ -12,10 +12,12 @@ export default function SellerParser() {
   const [products, setProducts] = useState<WbProduct[]>([]);
   const [sellerId, setSellerId] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [warning, setWarning] = useState<string | null>(null);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+    setWarning(null);
     setProducts([]);
     setSellerId("");
     setProgress(null);
@@ -84,6 +86,7 @@ export default function SellerParser() {
             } else if (event.type === "complete") {
               setProducts(event.products);
               if (event.sellerId) setSellerId(event.sellerId);
+              if (event.warning) setWarning(event.warning);
               sessionStorage.setItem("wb-last-seller-url", url.trim());
             } else if (event.type === "error") {
               throw new Error(event.message);
@@ -135,6 +138,12 @@ export default function SellerParser() {
           {isLoading ? "Загрузка..." : "Получить товары"}
         </button>
       </form>
+
+      {warning && (
+        <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-amber-800">
+          {warning}
+        </div>
+      )}
 
       {error && (
         <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-red-700">

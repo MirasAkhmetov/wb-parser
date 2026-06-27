@@ -74,6 +74,8 @@ export async function POST(request: NextRequest) {
           totalPages: result.totalPages,
           sellerId: result.sellerId,
           flaggedCount: result.flaggedCount,
+          partial: result.partial ?? false,
+          warning: result.warning,
         });
       } catch (error) {
         const { message, code } = getApiErrorPayload(error);
