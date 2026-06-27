@@ -44,16 +44,15 @@ export function wrapBrowserError(error: unknown): never {
 }
 
 async function launchOnVercel(): Promise<Browser> {
-  if (!process.env.BROWSERLESS_TOKEN) {
-    throw new ParseError(
-      "Не настроен BROWSERLESS_TOKEN в переменных окружения Vercel.",
-      "UNAVAILABLE"
-    );
-  }
+  const chromium = (await import("@sparticuz/chromium")).default;
 
-  return playwrightChromium.connect(
-    `wss://chrome.browserless.io?token=${process.env.BROWSERLESS_TOKEN}`
-  );
+  chromium.setGraphicsMode = false;
+
+  return playwrightChromium.launch({
+    args: [...chromium.args, ...LAUNCH_ARGS],
+    executablePath: await chromium.executablePath(),
+    headless: true,
+  });
 }
 
 async function applyStealthScripts(context: BrowserContext): Promise<void> {
