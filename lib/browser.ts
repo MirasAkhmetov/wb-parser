@@ -44,6 +44,13 @@ export function wrapBrowserError(error: unknown): never {
 }
 
 async function launchOnVercel(): Promise<Browser> {
+  if (!process.env.BROWSERLESS_TOKEN) {
+    throw new ParseError(
+      "На Vercel не настроен BROWSERLESS_TOKEN. Парсинг через API должен работать без браузера.",
+      "UNAVAILABLE"
+    );
+  }
+
   return playwrightChromium.connect(
     `wss://chrome.browserless.io?token=${process.env.BROWSERLESS_TOKEN}`
   );
@@ -190,9 +197,20 @@ export async function warmUpWbSession(page: Page): Promise<void> {
       waitUntil: "domcontentloaded",
       timeout: PAGE_LOAD_TIMEOUT,
     });
-  } catch {
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const isTimeout =
+      /timeout|timed out|ETIMEDOUT|aborted|AbortError/i.test(message);
+
+    if (isTimeout && process.env.VERCEL) {
+      throw new ParseError(
+        "Превышен лимит времени на Vercel (10 с на бесплатном тарифе). Обновите тариф до Pro или попробуйте позже.",
+        "UNAVAILABLE"
+      );
+    }
+
     throw new ParseError(
-      "Не удалось подключиться к Wildberries. Проверьте интернет.",
+      "Не удалось подключиться к Wildberries. Проверьте интернет или попробуйте позже.",
       "UNAVAILABLE"
     );
   }

@@ -11,6 +11,12 @@ import {
   waitForAntiBot,
   withWbPage,
 } from "./browser";
+import {
+  buildCatalogUrls,
+  fetchCatalogPageDirect,
+  type WbApiProduct,
+  type WbCatalogResponse,
+} from "./catalog-fetch";
 import { validateSellerInput } from "./seller-url";
 import { applyTrademarkFlags } from "./trademark";
 import {
@@ -21,30 +27,6 @@ import {
 
 const SELLER_PAGE_TIMEOUT = 60000;
 const PRODUCTS_PER_PAGE = 100;
-
-interface WbApiProduct {
-  id: number;
-  name: string;
-  brand?: string;
-  supplier?: string;
-  supplierId?: number;
-  subjectId?: number;
-  rating?: number;
-  feedbacks?: number;
-  time1?: number;
-  time2?: number;
-  sizes?: Array<{
-    price?: {
-      product?: number;
-      basic?: number;
-    };
-  }>;
-}
-
-interface WbCatalogResponse {
-  products?: WbApiProduct[];
-  total?: number;
-}
 
 function getProductPrice(product: WbApiProduct): {
   label: string;
@@ -93,27 +75,6 @@ function dedupeAndSort(products: WbProduct[]): WbProduct[] {
   return Array.from(map.values()).sort((a, b) =>
     a.title.localeCompare(b.title, "ru", { sensitivity: "base" })
   );
-}
-
-function buildCatalogUrls(sellerId: string, pageNum: number): string[] {
-  const params = new URLSearchParams({
-    ab_testing: "false",
-    appType: "1",
-    curr: "rub",
-    dest: "-1257786",
-    hide_dtype: "15",
-    hide_vflags: "4294967296",
-    lang: "ru",
-    page: String(pageNum),
-    sort: "popular",
-    spp: "30",
-    supplier: sellerId,
-  }).toString();
-
-  return [
-    `https://www.wildberries.ru/__internal/u-catalog/sellers/v4/catalog?${params}`,
-    `https://catalog.wb.ru/sellers/v4/catalog?${params}`,
-  ];
 }
 
 async function fetchCatalogPage(
@@ -255,6 +216,106 @@ async function loadFirstCatalogPage(
   }
 }
 
+async function parseSellerCatalog(
+  sellerId: string,
+  onProgress: ParseCallbacks["onProgress"],
+  fetchPage: (pageNum: number) => Promise<WbCatalogResponse>
+): Promise<{ allProducts: WbProduct[]; totalPages: number }> {
+  const allProducts: WbProduct[] = [];
+
+  const reportProgress = (
+    currentPage: number,
+    totalPages: number | null,
+    status: string
+  ) => {
+    onProgress?.({
+      currentPage,
+      totalPages,
+      productsFound: allProducts.length,
+      status,
+    });
+  };
+
+  reportProgress(1, null, "Загружаем каталог товаров...");
+
+  const firstPage = await fetchPage(1);
+  const total = firstPage.total ?? 0;
+
+  if (!firstPage.products?.length && total === 0) {
+    throw new ParseError("Товары не найдены.", "NOT_FOUND");
+  }
+
+  const totalPages = Math.max(1, Math.ceil(total / PRODUCTS_PER_PAGE));
+
+  for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
+    reportProgress(
+      pageNum,
+      totalPages,
+      `Страница ${pageNum} из ${totalPages} — загрузка...`
+    );
+
+    const catalogData = pageNum === 1 ? firstPage : await fetchPage(pageNum);
+    allProducts.push(...(catalogData.products ?? []).map(mapApiProduct));
+
+    reportProgress(
+      pageNum,
+      totalPages,
+      `Найдено ${allProducts.length} из ${total} товаров...`
+    );
+
+    if (!catalogData.products?.length) break;
+    if (pageNum >= totalPages) break;
+    if (pageNum > 1) await new Promise((r) => setTimeout(r, 200));
+  }
+
+  return { allProducts, totalPages };
+}
+
+function finalizeParseResult(
+  sellerId: string,
+  allProducts: WbProduct[],
+  totalPages: number,
+  trademarkOptions: TrademarkOptions
+): ParseResult {
+  const uniqueProducts = dedupeAndSort(allProducts);
+  const { products, flaggedCount } = applyTrademarkFlags(
+    uniqueProducts,
+    trademarkOptions
+  );
+
+  if (products.length === 0) {
+    throw new ParseError("Товары не найдены.", "NOT_FOUND");
+  }
+
+  return {
+    products,
+    totalPages,
+    sellerId,
+    flaggedCount,
+  };
+}
+
+async function parseWildberriesSellerViaApi(
+  sellerId: string,
+  callbacks: ParseCallbacks,
+  trademarkOptions: TrademarkOptions
+): Promise<ParseResult> {
+  const { allProducts, totalPages } = await parseSellerCatalog(
+    sellerId,
+    callbacks.onProgress,
+    (pageNum) => fetchCatalogPageDirect(sellerId, pageNum)
+  );
+
+  callbacks.onProgress?.({
+    currentPage: totalPages,
+    totalPages,
+    productsFound: allProducts.length,
+    status: `Готово! Найдено ${allProducts.length} товаров.`,
+  });
+
+  return finalizeParseResult(sellerId, allProducts, totalPages, trademarkOptions);
+}
+
 export async function parseWildberriesSeller(
   sellerUrl: string,
   callbacks: ParseCallbacks = {},
@@ -264,26 +325,39 @@ export async function parseWildberriesSeller(
   const sellerId = parsed.sellerId;
   const { onProgress } = callbacks;
 
+  if (process.env.VERCEL) {
+    try {
+      return await parseWildberriesSellerViaApi(
+        sellerId,
+        callbacks,
+        trademarkOptions
+      );
+    } catch (error) {
+      if (
+        error instanceof ParseError &&
+        (error.code === "BLOCKED" || error.code === "NOT_FOUND")
+      ) {
+        throw error;
+      }
+      // API недоступен с серверов Vercel — пробуем браузер как запасной вариант
+    }
+  }
+
   return withWbPage(async (page) => {
-    const allProducts: WbProduct[] = [];
-
-    const reportProgress = (
-      currentPage: number,
-      totalPages: number | null,
-      status: string
-    ) => {
-      onProgress?.({
-        currentPage,
-        totalPages,
-        productsFound: allProducts.length,
-        status,
-      });
-    };
-
-    reportProgress(1, null, "Подключаемся к Wildberries...");
+    onProgress?.({
+      currentPage: 1,
+      totalPages: null,
+      productsFound: 0,
+      status: "Подключаемся к Wildberries...",
+    });
 
     const firstPage = await loadFirstCatalogPage(page, sellerId, (status) =>
-      reportProgress(1, null, status)
+      onProgress?.({
+        currentPage: 1,
+        totalPages: null,
+        productsFound: 0,
+        status,
+      })
     );
 
     const total = firstPage.total ?? 0;
@@ -292,13 +366,15 @@ export async function parseWildberriesSeller(
     }
 
     const totalPages = Math.max(1, Math.ceil(total / PRODUCTS_PER_PAGE));
+    const allProducts: WbProduct[] = [];
 
     for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
-      reportProgress(
-        pageNum,
+      onProgress?.({
+        currentPage: pageNum,
         totalPages,
-        `Страница ${pageNum} из ${totalPages} — загрузка...`
-      );
+        productsFound: allProducts.length,
+        status: `Страница ${pageNum} из ${totalPages} — загрузка...`,
+      });
 
       const catalogData =
         pageNum === 1
@@ -307,38 +383,30 @@ export async function parseWildberriesSeller(
 
       allProducts.push(...(catalogData.products ?? []).map(mapApiProduct));
 
-      reportProgress(
-        pageNum,
+      onProgress?.({
+        currentPage: pageNum,
         totalPages,
-        `Найдено ${allProducts.length} из ${total} товаров...`
-      );
+        productsFound: allProducts.length,
+        status: `Найдено ${allProducts.length} из ${total} товаров...`,
+      });
 
       if (!catalogData.products?.length) break;
       if (pageNum >= totalPages) break;
       await page.waitForTimeout(400);
     }
 
-    const uniqueProducts = dedupeAndSort(allProducts);
-    const { products, flaggedCount } = applyTrademarkFlags(
-      uniqueProducts,
+    onProgress?.({
+      currentPage: totalPages,
+      totalPages,
+      productsFound: allProducts.length,
+      status: `Готово! Найдено ${allProducts.length} товаров.`,
+    });
+
+    return finalizeParseResult(
+      sellerId,
+      allProducts,
+      totalPages,
       trademarkOptions
     );
-
-    if (products.length === 0) {
-      throw new ParseError("Товары не найдены.", "NOT_FOUND");
-    }
-
-    reportProgress(
-      totalPages,
-      totalPages,
-      `Готово! Найдено ${products.length} товаров.`
-    );
-
-    return {
-      products,
-      totalPages,
-      sellerId,
-      flaggedCount,
-    };
   });
 }

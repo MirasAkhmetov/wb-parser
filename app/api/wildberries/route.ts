@@ -42,6 +42,14 @@ export async function POST(request: NextRequest) {
       };
 
       try {
+        send({
+          type: "progress",
+          currentPage: 0,
+          totalPages: null,
+          productsFound: 0,
+          status: "Запуск...",
+        });
+
         const result = await parseWildberriesSeller(
           url.trim(),
           {
