@@ -44,13 +44,9 @@ export function wrapBrowserError(error: unknown): never {
 }
 
 async function launchOnVercel(): Promise<Browser> {
-  const chromium = (await import("@sparticuz/chromium")).default;
-
-  return playwrightChromium.launch({
-    args: chromium.args,
-    executablePath: await chromium.executablePath(),
-    headless: true,
-  });
+  return playwrightChromium.connect(
+    `wss://chrome.browserless.io?token=${process.env.BROWSERLESS_TOKEN}`
+  );
 }
 
 async function applyStealthScripts(context: BrowserContext): Promise<void> {
