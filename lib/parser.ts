@@ -246,26 +246,49 @@ async function parseSellerCatalog(
   }
 
   const totalPages = Math.max(1, Math.ceil(total / PRODUCTS_PER_PAGE));
+  allProducts.push(...(firstPage.products ?? []).map(mapApiProduct));
 
-  for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
-    reportProgress(
-      pageNum,
-      totalPages,
-      `Страница ${pageNum} из ${totalPages} — загрузка...`
+  reportProgress(
+    1,
+    totalPages,
+    `Найдено ${allProducts.length} из ${total} товаров...`
+  );
+
+  if (totalPages > 1) {
+    const remainingPages = Array.from(
+      { length: totalPages - 1 },
+      (_, index) => index + 2
     );
+    const batchSize = process.env.VERCEL ? 4 : 2;
 
-    const catalogData = pageNum === 1 ? firstPage : await fetchPage(pageNum);
-    allProducts.push(...(catalogData.products ?? []).map(mapApiProduct));
+    for (let index = 0; index < remainingPages.length; index += batchSize) {
+      const batch = remainingPages.slice(index, index + batchSize);
+      const lastPageInBatch = batch[batch.length - 1] ?? totalPages;
 
-    reportProgress(
-      pageNum,
-      totalPages,
-      `Найдено ${allProducts.length} из ${total} товаров...`
-    );
+      reportProgress(
+        lastPageInBatch,
+        totalPages,
+        `Страница ${lastPageInBatch} из ${totalPages} — загрузка...`
+      );
 
-    if (!catalogData.products?.length) break;
-    if (pageNum >= totalPages) break;
-    if (pageNum > 1) await new Promise((r) => setTimeout(r, 200));
+      const batchResults = await Promise.all(batch.map((pageNum) => fetchPage(pageNum)));
+      let hasEmptyPage = false;
+
+      for (const catalogData of batchResults) {
+        allProducts.push(...(catalogData.products ?? []).map(mapApiProduct));
+        if (!catalogData.products?.length) {
+          hasEmptyPage = true;
+        }
+      }
+
+      reportProgress(
+        lastPageInBatch,
+        totalPages,
+        `Найдено ${allProducts.length} из ${total} товаров...`
+      );
+
+      if (hasEmptyPage) break;
+    }
   }
 
   return { allProducts, totalPages };
@@ -325,22 +348,24 @@ export async function parseWildberriesSeller(
   const sellerId = parsed.sellerId;
   const { onProgress } = callbacks;
 
-  if (process.env.VERCEL) {
-    try {
-      return await parseWildberriesSellerViaApi(
-        sellerId,
-        callbacks,
-        trademarkOptions
-      );
-    } catch (error) {
-      if (
-        error instanceof ParseError &&
-        (error.code === "BLOCKED" || error.code === "NOT_FOUND")
-      ) {
-        throw error;
-      }
-      // API недоступен с серверов Vercel — пробуем браузер как запасной вариант
+  try {
+    return await parseWildberriesSellerViaApi(
+      sellerId,
+      callbacks,
+      trademarkOptions
+    );
+  } catch (error) {
+    if (process.env.VERCEL) throw error;
+
+    if (
+      error instanceof ParseError &&
+      (error.code === "BLOCKED" ||
+        error.code === "NOT_FOUND" ||
+        error.code === "INVALID_URL")
+    ) {
+      throw error;
     }
+    // Локально — запасной вариант через браузер
   }
 
   return withWbPage(async (page) => {

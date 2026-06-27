@@ -3,6 +3,8 @@ import { ParseError } from "./types";
 const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36";
 
+const FETCH_TIMEOUT_MS = process.env.VERCEL ? 5000 : 12000;
+
 export interface WbApiProduct {
   id: number;
   name: string;
@@ -42,10 +44,56 @@ export function buildCatalogUrls(sellerId: string, pageNum: number): string[] {
     supplier: sellerId,
   }).toString();
 
-  return [
+  const urls = [
     `https://catalog.wb.ru/sellers/v4/catalog?${params}`,
-    `https://www.wildberries.ru/__internal/u-catalog/sellers/v4/catalog?${params}`,
   ];
+
+  if (!process.env.VERCEL) {
+    urls.push(
+      `https://www.wildberries.ru/__internal/u-catalog/sellers/v4/catalog?${params}`
+    );
+  }
+
+  return urls;
+}
+
+async function fetchCatalogUrl(
+  url: string,
+  referer: string
+): Promise<WbCatalogResponse> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(url, {
+      headers: {
+        Accept: "application/json, text/plain, */*",
+        "Accept-Language": "ru-RU,ru;q=0.9",
+        Referer: referer,
+        Origin: "https://www.wildberries.ru",
+        "User-Agent": USER_AGENT,
+      },
+      cache: "no-store",
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      throw new ParseError(`HTTP ${response.status}`, "UNAVAILABLE");
+    }
+
+    const contentType = response.headers.get("content-type") ?? "";
+    if (!contentType.includes("json")) {
+      throw new ParseError("Не JSON ответ", "BLOCKED");
+    }
+
+    const data = (await response.json()) as WbCatalogResponse;
+    return {
+      products: data.products ?? [],
+      total: data.total ?? 0,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export async function fetchCatalogPageDirect(
@@ -54,48 +102,38 @@ export async function fetchCatalogPageDirect(
 ): Promise<WbCatalogResponse> {
   const referer = `https://www.wildberries.ru/seller/${sellerId}`;
   const urls = buildCatalogUrls(sellerId, pageNum);
-  let lastStatus = 0;
+  const errors: unknown[] = [];
 
-  for (const url of urls) {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const response = await fetch(url, {
-          headers: {
-            Accept: "application/json, text/plain, */*",
-            "Accept-Language": "ru-RU,ru;q=0.9",
-            Referer: referer,
-            "User-Agent": USER_AGENT,
-          },
-          signal: AbortSignal.timeout(15000),
-        });
-
-        if (!response.ok) {
-          lastStatus = response.status;
-          continue;
-        }
-
-        const data = (await response.json()) as WbCatalogResponse;
-        return {
-          products: data.products ?? [],
-          total: data.total ?? 0,
-        };
-      } catch {
-        if (attempt === 0) {
-          await new Promise((r) => setTimeout(r, 500));
-        }
-      }
+  const attempts = urls.map(async (url) => {
+    try {
+      return await fetchCatalogUrl(url, referer);
+    } catch (error) {
+      errors.push(error);
+      throw error;
     }
-  }
+  });
 
-  if (lastStatus === 403 || lastStatus === 429) {
+  try {
+    return await Promise.any(attempts);
+  } catch {
+    const blocked = errors.some(
+      (error) =>
+        error instanceof ParseError &&
+        (error.code === "BLOCKED" || /HTTP 403|HTTP 429/.test(error.message))
+    );
+
+    if (blocked) {
+      throw new ParseError(
+        "Сайт блокирует автоматический доступ. Попробуйте через 10–15 минут.",
+        "BLOCKED"
+      );
+    }
+
     throw new ParseError(
-      "Сайт блокирует автоматический доступ. Попробуйте через 10–15 минут.",
-      "BLOCKED"
+      process.env.VERCEL
+        ? "Wildberries не отвечает с серверов Vercel. Попробуйте ещё раз или запустите локально: npm run dev"
+        : "Не удалось получить данные каталога. Попробуйте ещё раз.",
+      "UNAVAILABLE"
     );
   }
-
-  throw new ParseError(
-    "Не удалось получить данные каталога. Попробуйте ещё раз.",
-    "UNAVAILABLE"
-  );
 }

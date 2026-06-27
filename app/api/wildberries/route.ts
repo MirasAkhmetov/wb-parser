@@ -5,6 +5,7 @@ import { getApiErrorPayload } from "@/lib/api-error";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
+export const preferredRegion = ["fra1", "cdg1", "arn1"];
 
 interface RequestBody {
   url: string;
@@ -41,6 +42,10 @@ export async function POST(request: NextRequest) {
         );
       };
 
+      const heartbeat = setInterval(() => {
+        send({ type: "heartbeat" });
+      }, 2000);
+
       try {
         send({
           type: "progress",
@@ -75,6 +80,7 @@ export async function POST(request: NextRequest) {
         const { message, code } = getApiErrorPayload(error);
         send({ type: "error", message, code });
       } finally {
+        clearInterval(heartbeat);
         controller.close();
       }
     },
@@ -83,8 +89,9 @@ export async function POST(request: NextRequest) {
   return new Response(stream, {
     headers: {
       "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
+      "Cache-Control": "no-cache, no-transform",
       Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
     },
   });
 }

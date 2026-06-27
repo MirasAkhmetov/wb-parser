@@ -38,10 +38,27 @@ export default function SellerParser() {
 
       const decoder = new TextDecoder();
       let buffer = "";
+      let lastEventAt = Date.now();
+      const stallMs = 15000;
+      const stallTimer = setInterval(() => {
+        if (Date.now() - lastEventAt > stallMs) {
+          void reader.cancel();
+        }
+      }, 1000);
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            if (Date.now() - lastEventAt > stallMs) {
+              throw new Error(
+                "Сервер не отвечает слишком долго. Попробуйте ещё раз."
+              );
+            }
+            break;
+          }
+
+          lastEventAt = Date.now();
 
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split("\n");
@@ -54,7 +71,10 @@ export default function SellerParser() {
 
           try {
             const event = JSON.parse(json);
-            if (event.type === "progress") {
+            if (event.type === "heartbeat") {
+              lastEventAt = Date.now();
+            } else if (event.type === "progress") {
+              lastEventAt = Date.now();
               setProgress({
                 currentPage: event.currentPage,
                 totalPages: event.totalPages,
@@ -74,6 +94,9 @@ export default function SellerParser() {
             }
           }
         }
+        }
+      } finally {
+        clearInterval(stallTimer);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Неизвестная ошибка.");
