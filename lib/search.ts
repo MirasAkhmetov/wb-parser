@@ -7,6 +7,7 @@ import type {
 import { ParseError } from "./types";
 import { getSellersLegalInfo } from "./seller-info";
 import {
+  blockedError,
   isBlockedPageContent,
   waitForAntiBot,
 } from "./browser";
@@ -194,10 +195,7 @@ async function openSearchPage(
       const content = await page.content();
       if (isBlockedPageContent(content)) {
         page.off("response", onResponse);
-        throw new ParseError(
-          "Сайт блокирует автоматический доступ. Попробуйте через 10–15 минут.",
-          "BLOCKED"
-        );
+        throw blockedError();
       }
     }
   }
@@ -226,11 +224,8 @@ async function fetchSearchPage(
     lastStatus = result.status;
   }
 
-  if (lastStatus === 403 || lastStatus === 429) {
-    throw new ParseError(
-      "Сайт блокирует автоматический доступ. Попробуйте через 10–15 минут.",
-      "BLOCKED"
-    );
+  if (lastStatus === 403 || lastStatus === 429 || lastStatus === 498) {
+    throw blockedError();
   }
 
   throw new ParseError("Не удалось выполнить поиск.", "UNAVAILABLE");

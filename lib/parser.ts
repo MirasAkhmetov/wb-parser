@@ -6,14 +6,8 @@ import type {
   WbProduct,
 } from "./types";
 import { ParseError } from "./types";
+import { blockedError, waitForAntiBot, withWbPage } from "./browser";
 import {
-  isBlockedPageContent,
-  waitForAntiBot,
-  withWbPage,
-} from "./browser";
-import {
-  buildCatalogUrls,
-  fetchCatalogPageDirect,
   PAGE_DELAY_MS,
   type WbApiProduct,
   type WbCatalogResponse,
@@ -28,6 +22,15 @@ import {
 
 const SELLER_PAGE_TIMEOUT = 60000;
 const PRODUCTS_PER_PAGE = 100;
+
+/** Готовый каталог продавца переиспользуем, а не парсим заново при каждом запросе */
+const RESULT_CACHE_TTL_MS = 15 * 60_000;
+const resultCache = new Map<
+  string,
+  { expiresAt: number; products: WbProduct[]; totalPages: number }
+>();
+
+const BLOCK_STATUSES = new Set([403, 498]);
 
 function getProductPrice(product: WbApiProduct): {
   label: string;
@@ -78,66 +81,6 @@ function dedupeAndSort(products: WbProduct[]): WbProduct[] {
   );
 }
 
-async function fetchCatalogPage(
-  page: Page,
-  sellerId: string,
-  pageNum: number
-): Promise<WbCatalogResponse> {
-  const urls = buildCatalogUrls(sellerId, pageNum, { withInternal: true });
-  const referer = `https://www.wildberries.ru/seller/${sellerId}`;
-  let lastStatus = 0;
-
-  for (const apiUrl of urls) {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const result = await page.evaluate(
-          async ({ url, ref }) => {
-            const response = await fetch(url, {
-              headers: {
-                Accept: "application/json, text/plain, */*",
-                Referer: ref,
-              },
-              credentials: "include",
-            });
-            if (!response.ok) {
-              return {
-                error: true,
-                status: response.status,
-                products: [],
-                total: 0,
-              };
-            }
-            const data = await response.json();
-            return {
-              error: false,
-              status: response.status,
-              products: data.products ?? [],
-              total: data.total ?? 0,
-            };
-          },
-          { url: apiUrl, ref: referer }
-        );
-
-        if (!result.error) {
-          return { products: result.products, total: result.total };
-        }
-        lastStatus = result.status;
-      } catch {
-        await page.waitForTimeout(1000);
-      }
-    }
-  }
-
-  if (lastStatus === 403 || lastStatus === 429) {
-    throw new ParseError(
-      "Сайт блокирует автоматический доступ. Попробуйте через 10–15 минут или с другого интернета.",
-      "BLOCKED"
-    );
-  }
-
-  throw new ParseError("Не удалось получить данные каталога.", "UNAVAILABLE");
-}
-
 async function scrapeSellerProductsFromDom(page: Page): Promise<WbApiProduct[]> {
   return page.evaluate(() => {
     const cards = document.querySelectorAll("article.product-card");
@@ -179,16 +122,36 @@ async function scrapeSellerProductsFromDom(page: Page): Promise<WbApiProduct[]> 
   });
 }
 
-async function warmSellerSession(
+/**
+ * Открываем страницу продавца как обычный посетитель и забираем страницу
+ * каталога из ответа, который запрашивает сам сайт. Отдельных запросов
+ * к API каталога из скрипта не делаем: WB распознаёт их как бота.
+ */
+async function openSellerPage(
   page: Page,
-  sellerId: string
+  sellerId: string,
+  pageNum = 1
 ): Promise<WbCatalogResponse | null> {
-  const sellerUrl = `https://www.wildberries.ru/seller/${sellerId}`;
-  const state: { captured: WbCatalogResponse | null } = { captured: null };
+  const sellerUrl =
+    pageNum > 1
+      ? `https://www.wildberries.ru/seller/${sellerId}?page=${pageNum}`
+      : `https://www.wildberries.ru/seller/${sellerId}`;
+  const state: { captured: WbCatalogResponse | null; blocked: boolean } = {
+    captured: null,
+    blocked: false,
+  };
 
   const onResponse = async (response: Response) => {
     const url = response.url();
-    if (!url.includes("catalog") || response.status() !== 200) return;
+    if (!url.includes("catalog")) return;
+    if (BLOCK_STATUSES.has(response.status())) {
+      state.blocked = true;
+      return;
+    }
+    if (response.status() !== 200) return;
+    // Нужна именно запрошенная страница каталога
+    const requestedPage = Number(new URL(url).searchParams.get("page") ?? "1");
+    if (requestedPage !== pageNum) return;
 
     try {
       const data = (await response.json()) as WbCatalogResponse;
@@ -206,139 +169,53 @@ async function warmSellerSession(
   page.on("response", onResponse);
 
   try {
-    await page.goto(sellerUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: SELLER_PAGE_TIMEOUT,
-    });
+    try {
+      await page.goto(sellerUrl, {
+        waitUntil: "domcontentloaded",
+        timeout: SELLER_PAGE_TIMEOUT,
+      });
+    } catch {
+      // навигация могла оборваться после загрузки данных — проверим ниже
+    }
 
-    await waitForAntiBot(page, 15000);
-    await page.waitForTimeout(2000);
+    // Пусть браузер сам пройдёт проверку; если не прошла — BLOCKED без повторов
+    await waitForAntiBot(page, 20000);
 
     try {
       await page.waitForSelector("article.product-card", { timeout: 25000 });
     } catch {
-      // cards may load later; network capture may still work
+      // карточки могут не отрисоваться, но ответ каталога уже перехвачен
     }
 
-    await page.mouse.wheel(0, 600);
-    await page.waitForTimeout(2000);
-
-    if (state.captured?.products?.length) {
-      return state.captured;
+    if (!state.captured) {
+      await page.mouse.wheel(0, 600);
+      await page.waitForTimeout(2000);
     }
-  } catch {
-    // navigation errors are ok if data was captured
+
+    if (!state.captured && state.blocked) throw blockedError();
+    return state.captured;
   } finally {
     page.off("response", onResponse);
   }
-
-  return state.captured;
 }
 
-async function loadFirstCatalogPage(
+/** Страница каталога: из ответа сайта, а если его не поймали — из DOM */
+async function loadCatalogPage(
   page: Page,
   sellerId: string,
-  onStatus: (status: string) => void
+  pageNum: number
 ): Promise<WbCatalogResponse> {
-  onStatus("Открываем страницу продавца...");
-  const captured = await warmSellerSession(page, sellerId);
+  const captured = await openSellerPage(page, sellerId, pageNum);
   if (captured?.products?.length || (captured?.total ?? 0) > 0) {
     return captured!;
   }
 
-  onStatus("Загружаем каталог товаров...");
-  try {
-    return await fetchCatalogPage(page, sellerId, 1);
-  } catch (error) {
-    const domProducts = await scrapeSellerProductsFromDom(page);
-    if (domProducts.length > 0) {
-      return {
-        products: domProducts,
-        total: domProducts.length,
-      };
-    }
-
-    if (error instanceof ParseError && error.code === "BLOCKED") {
-      const content = await page.content();
-      if (isBlockedPageContent(content)) throw error;
-    }
-    throw error;
-  }
-}
-
-async function parseSellerCatalog(
-  sellerId: string,
-  onProgress: ParseCallbacks["onProgress"],
-  fetchPage: (pageNum: number) => Promise<WbCatalogResponse>
-): Promise<{ allProducts: WbProduct[]; totalPages: number; partial: boolean; total: number }> {
-  const allProducts: WbProduct[] = [];
-  let partial = false;
-
-  const reportProgress = (
-    currentPage: number,
-    totalPages: number | null,
-    status: string
-  ) => {
-    onProgress?.({
-      currentPage,
-      totalPages,
-      productsFound: allProducts.length,
-      status,
-    });
-  };
-
-  reportProgress(1, null, "Загружаем каталог товаров...");
-
-  const firstPage = await fetchPage(1);
-  const total = firstPage.total ?? 0;
-
-  if (!firstPage.products?.length && total === 0) {
-    throw new ParseError("Товары не найдены.", "NOT_FOUND");
+  const domProducts = await scrapeSellerProductsFromDom(page);
+  if (domProducts.length > 0) {
+    return { products: domProducts, total: domProducts.length };
   }
 
-  const totalPages = Math.max(1, Math.ceil(total / PRODUCTS_PER_PAGE));
-  allProducts.push(...(firstPage.products ?? []).map(mapApiProduct));
-
-  reportProgress(
-    1,
-    totalPages,
-    `Найдено ${allProducts.length} из ${total} товаров...`
-  );
-
-  for (let pageNum = 2; pageNum <= totalPages; pageNum++) {
-    reportProgress(
-      pageNum,
-      totalPages,
-      `Страница ${pageNum} из ${totalPages} — загрузка...`
-    );
-
-    await new Promise((r) => setTimeout(r, PAGE_DELAY_MS));
-
-    try {
-      const catalogData = await fetchPage(pageNum);
-      if (!catalogData.products?.length) break;
-
-      allProducts.push(...catalogData.products.map(mapApiProduct));
-      reportProgress(
-        pageNum,
-        totalPages,
-        `Найдено ${allProducts.length} из ${total} товаров...`
-      );
-    } catch (error) {
-      if (allProducts.length > 0) {
-        partial = true;
-        reportProgress(
-          pageNum,
-          totalPages,
-          `Загружено ${allProducts.length} из ${total} — Wildberries ограничил доступ к остальным страницам.`
-        );
-        break;
-      }
-      throw error;
-    }
-  }
-
-  return { allProducts, totalPages, partial, total };
+  throw new ParseError("Не удалось получить данные каталога.", "UNAVAILABLE");
 }
 
 function finalizeParseResult(
@@ -373,34 +250,6 @@ function finalizeParseResult(
   };
 }
 
-async function parseWildberriesSellerViaApi(
-  sellerId: string,
-  callbacks: ParseCallbacks,
-  trademarkOptions: TrademarkOptions
-): Promise<ParseResult> {
-  const { allProducts, totalPages, partial, total } = await parseSellerCatalog(
-    sellerId,
-    callbacks.onProgress,
-    (pageNum) => fetchCatalogPageDirect(sellerId, pageNum)
-  );
-
-  const status = partial
-    ? `Частично: ${allProducts.length} из ${total} товаров.`
-    : `Готово! Найдено ${allProducts.length} товаров.`;
-
-  callbacks.onProgress?.({
-    currentPage: totalPages,
-    totalPages,
-    productsFound: allProducts.length,
-    status,
-  });
-
-  return finalizeParseResult(sellerId, allProducts, totalPages, trademarkOptions, {
-    partial,
-    total,
-  });
-}
-
 export async function parseWildberriesSeller(
   sellerUrl: string,
   callbacks: ParseCallbacks = {},
@@ -410,46 +259,31 @@ export async function parseWildberriesSeller(
   const sellerId = parsed.sellerId;
   const { onProgress } = callbacks;
 
-  if (!process.env.VERCEL) {
-    try {
-      return await parseWildberriesSellerViaApi(
-        sellerId,
-        callbacks,
-        trademarkOptions
-      );
-    } catch (error) {
-      if (
-        error instanceof ParseError &&
-        (error.code === "NOT_FOUND" || error.code === "INVALID_URL")
-      ) {
-        throw error;
-      }
-
-      onProgress?.({
-        currentPage: 0,
-        totalPages: null,
-        productsFound: 0,
-        status: "Подключаемся к Wildberries...",
-      });
-    }
-  } else {
+  const cached = resultCache.get(sellerId);
+  if (cached && cached.expiresAt > Date.now()) {
     onProgress?.({
-      currentPage: 0,
-      totalPages: null,
-      productsFound: 0,
-      status: "Открываем страницу продавца...",
+      currentPage: cached.totalPages,
+      totalPages: cached.totalPages,
+      productsFound: cached.products.length,
+      status: `Готово! Найдено ${cached.products.length} товаров (из кэша).`,
     });
+    return finalizeParseResult(
+      sellerId,
+      cached.products,
+      cached.totalPages,
+      trademarkOptions
+    );
   }
 
+  onProgress?.({
+    currentPage: 0,
+    totalPages: null,
+    productsFound: 0,
+    status: "Открываем страницу продавца...",
+  });
+
   return withWbPage(async (page) => {
-    const firstPage = await loadFirstCatalogPage(page, sellerId, (status) =>
-      onProgress?.({
-        currentPage: 1,
-        totalPages: null,
-        productsFound: 0,
-        status,
-      })
-    );
+    const firstPage = await loadCatalogPage(page, sellerId, 1);
 
     const total = firstPage.total ?? 0;
     if (!firstPage.products?.length && total === 0) {
@@ -480,7 +314,7 @@ export async function parseWildberriesSeller(
       await page.waitForTimeout(PAGE_DELAY_MS);
 
       try {
-        const catalogData = await fetchCatalogPage(page, sellerId, pageNum);
+        const catalogData = await loadCatalogPage(page, sellerId, pageNum);
         if (!catalogData.products?.length) break;
 
         allProducts.push(...catalogData.products.map(mapApiProduct));
@@ -491,33 +325,28 @@ export async function parseWildberriesSeller(
           status: `Найдено ${allProducts.length} из ${total} товаров...`,
         });
       } catch (error) {
-        if (allProducts.length > 0) {
-          partial = true;
-          try {
-            await page.mouse.wheel(0, 1200);
-            await page.waitForTimeout(1500);
-            const domProducts = await scrapeSellerProductsFromDom(page);
-            const known = new Set(allProducts.map((p) => p.article));
-            for (const product of domProducts) {
-              const mapped = mapApiProduct(product);
-              if (!known.has(mapped.article)) {
-                allProducts.push(mapped);
-                known.add(mapped.article);
-              }
-            }
-          } catch {
-            // ignore DOM scrape errors
-          }
-          onProgress?.({
-            currentPage: pageNum,
-            totalPages,
-            productsFound: allProducts.length,
-            status: `Загружено ${allProducts.length} из ${total} — Wildberries ограничил доступ к остальным страницам.`,
-          });
-          break;
-        }
-        throw error;
+        // Уже собранное не теряем: отдаём частичный результат
+        partial = true;
+        onProgress?.({
+          currentPage: pageNum,
+          totalPages,
+          productsFound: allProducts.length,
+          status: `Загружено ${allProducts.length} из ${total} — ${
+            error instanceof ParseError && error.code === "BLOCKED"
+              ? "Wildberries ограничил доступ к остальным страницам."
+              : "остальные страницы не загрузились."
+          }`,
+        });
+        break;
       }
+    }
+
+    if (!partial) {
+      resultCache.set(sellerId, {
+        expiresAt: Date.now() + RESULT_CACHE_TTL_MS,
+        products: allProducts,
+        totalPages,
+      });
     }
 
     const status = partial
@@ -535,5 +364,5 @@ export async function parseWildberriesSeller(
       partial,
       total,
     });
-  }, { skipWarmup: !!process.env.VERCEL });
+  }, { skipWarmup: true });
 }

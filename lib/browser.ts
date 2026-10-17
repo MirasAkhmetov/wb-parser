@@ -214,85 +214,161 @@ export async function warmUpWbSession(page: Page): Promise<void> {
     );
   }
 
-  await waitForAntiBot(page, 10000);
+  await waitForAntiBot(page, 20000);
   await page.waitForTimeout(1000);
 }
 
+/** Признаки страницы проверки антибота wbaas / старой заглушки WB */
+const CHALLENGE_MARKERS = [
+  "__wbaas/challenges",
+  "подтвердите, что вы не робот",
+  "доступ ограничен",
+  "access denied",
+];
+
+export function isBlockedPageContent(content: string): boolean {
+  const lower = content.toLowerCase();
+  return CHALLENGE_MARKERS.some((marker) => lower.includes(marker));
+}
+
+async function isOnChallengePage(page: Page): Promise<boolean> {
+  try {
+    const title = await page.title();
+    if (
+      title.includes("Почти готово") ||
+      title.includes("доступ ограничен") ||
+      title.includes("Access denied")
+    ) {
+      return true;
+    }
+    return isBlockedPageContent(await page.content());
+  } catch {
+    // страница перезагружается после проверки — считаем, что ещё ждём
+    return true;
+  }
+}
+
+/**
+ * Ждём, пока браузер сам пройдёт проверку WB (как у обычного посетителя).
+ * Если проверка не прошла за отведённое время (например, требуется капча),
+ * сообщаем о блокировке — без повторных попыток.
+ */
 export async function waitForAntiBot(
   page: Page,
-  maxWaitMs = 10000
+  maxWaitMs = 20000
 ): Promise<void> {
   const started = Date.now();
 
   while (Date.now() - started < maxWaitMs) {
-    const title = await page.title();
-    const blockedTitle =
-      title.includes("Почти готово") ||
-      title.includes("доступ ограничен") ||
-      title.includes("Access denied");
+    if (!(await isOnChallengePage(page))) return;
+    await page.waitForTimeout(1500);
+  }
 
-    if (!blockedTitle) return;
-    await page.waitForTimeout(2000);
+  if (await isOnChallengePage(page)) {
+    throw blockedError();
   }
 }
 
-export function isBlockedPageContent(content: string): boolean {
-  const lower = content.toLowerCase();
-  return (
-    lower.includes("подтвердите, что вы не робот") ||
-    lower.includes("доступ ограничен") ||
-    lower.includes("access denied")
+/* ------------------------------------------------------------------ */
+/* Пауза после блокировки                                              */
+/* ------------------------------------------------------------------ */
+
+/** После блокировки не трогаем WB, чтобы не продлевать бан IP */
+const BLOCK_COOLDOWN_MS = 10 * 60_000;
+let blockedUntil = 0;
+
+export function markWbBlocked(): void {
+  blockedUntil = Date.now() + BLOCK_COOLDOWN_MS;
+}
+
+export function blockedError(): ParseError {
+  markWbBlocked();
+  return new ParseError(
+    "Wildberries ограничил доступ (проверка антибота). Повторите через 10–15 минут — частые повторы продлевают блокировку.",
+    "BLOCKED"
   );
+}
+
+function assertNotCoolingDown(): void {
+  const left = blockedUntil - Date.now();
+  if (left <= 0) return;
+  const minutes = Math.ceil(left / 60_000);
+  throw new ParseError(
+    `Wildberries недавно ограничил доступ. Повторите через ${minutes} мин — частые повторы продлевают блокировку.`,
+    "BLOCKED"
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Очередь: одна браузерная сессия к WB одновременно                   */
+/* ------------------------------------------------------------------ */
+
+let queue: Promise<unknown> = Promise.resolve();
+
+function enqueue<T>(task: () => Promise<T>): Promise<T> {
+  const run = queue.then(task, task);
+  queue = run.catch(() => undefined);
+  return run;
 }
 
 export async function withWbPage<T>(
   fn: (page: Page) => Promise<T>,
   options: { skipWarmup?: boolean } = {}
 ): Promise<T> {
-  let lastError: unknown;
+  assertNotCoolingDown();
 
-  for (let attempt = 0; attempt < 2; attempt++) {
-    let cleanup = async () => {};
+  return enqueue(async () => {
+    // Пока ждали в очереди, другой запрос мог получить блокировку
+    assertNotCoolingDown();
 
-    try {
-      const session = await createEphemeralPage();
-      cleanup = session.cleanup;
-      const { page } = session;
+    let lastError: unknown;
 
-      if (!options.skipWarmup) {
-        await warmUpWbSession(page);
-      }
-      return await fn(page);
-    } catch (error) {
-      lastError = error;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let cleanup = async () => {};
 
-      const shouldRetry =
-        attempt === 0 &&
-        (error instanceof ParseError
-          ? error.code === "BLOCKED" || error.code === "UNAVAILABLE"
-          : error instanceof Error &&
-            /execution context was destroyed|target closed/i.test(
-              error.message
-            ));
+      try {
+        const session = await createEphemeralPage();
+        cleanup = session.cleanup;
+        const { page } = session;
 
-      if (shouldRetry) {
-        if (!process.env.VERCEL) {
-          try {
-            await localContext?.close();
-          } catch {
-            // ignore
-          }
-          localContext = null;
+        if (!options.skipWarmup) {
+          await warmUpWbSession(page);
         }
-        await new Promise((r) => setTimeout(r, 3000));
-        continue;
+        return await fn(page);
+      } catch (error) {
+        lastError = error;
+
+        // Блокировку не повторяем: повтор сразу же только продлевает бан.
+        // Повторяем лишь технические сбои браузера/сети.
+        const shouldRetry =
+          attempt === 0 &&
+          (error instanceof ParseError
+            ? error.code === "UNAVAILABLE"
+            : error instanceof Error &&
+              /execution context was destroyed|target closed/i.test(
+                error.message
+              ));
+
+        if (shouldRetry) {
+          if (!process.env.VERCEL && !(error instanceof ParseError)) {
+            // Пересоздаём только упавший браузер; профиль с cookie сохраняется на диске
+            try {
+              await localContext?.close();
+            } catch {
+              // ignore
+            }
+            localContext = null;
+          }
+          await new Promise((r) => setTimeout(r, 3000));
+          continue;
+        }
+
+        wrapBrowserError(error);
+      } finally {
+        await cleanup();
       }
-
-      wrapBrowserError(error);
-    } finally {
-      await cleanup();
     }
-  }
 
-  wrapBrowserError(lastError);
+    wrapBrowserError(lastError);
+  });
 }
